@@ -569,11 +569,29 @@ if QtWidgets:
             self.setCentralWidget(self.editor)
 
             # Preview panel
+            # Build a small container with a checkbox above the preview list
+            preview_container = QtWidgets.QWidget()
+            preview_layout = QtWidgets.QVBoxLayout(preview_container)
+            preview_layout.setContentsMargins(4, 4, 4, 4)
+            preview_layout.setSpacing(6)
+
+            # Checkbox to enable click-to-copy behavior for preview items
+            self.chk_copy_preview = QtWidgets.QCheckBox("Enable Copy to Clipboard")
+            self.chk_copy_preview.setToolTip("When enabled, click a tweet in the preview to copy it to the clipboard.")
+            preview_layout.addWidget(self.chk_copy_preview)
+
             self.preview = QtWidgets.QListWidget()
             self.preview.setMinimumWidth(350)
+            self.preview.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+            preview_layout.addWidget(self.preview, 1)
+
             dock = QtWidgets.QDockWidget("Preview", self)
-            dock.setWidget(self.preview)
+            dock.setWidget(preview_container)
             self.addDockWidget(QtCore.Qt.RightDockWidgetArea, dock)
+
+            # Clicking on a preview item copies its text to clipboard when enabled.
+            # Note: Qt's QApplication.clipboard() is cross‑platform (Windows/macOS/Linux), so this works across platforms.
+            self.preview.itemClicked.connect(self._on_preview_item_clicked)
 
             # Status bar labels
             self.status_chars = QtWidgets.QLabel("Chars: 0")
