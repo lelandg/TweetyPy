@@ -2,7 +2,6 @@
 
 ### A cross‑platform Python app to compose long tweets (threads) and help post them to Twitter. 
 
-
 ## Features
 
 - Includes a modern GUI (when PySide6 is installed) and a CLI for automation. 
@@ -15,6 +14,9 @@
 - Import text from many formats (txt, md, csv, json, py; optional: pdf, docx, html).
 - Secure-ish credentials: prefers OS keyring; encrypted file fallback.
 - Auto-saved draft history; file open/save tracked in recent files.
+
+## Important Note About API Keys and Tokens
+I do not have a Twitter API key or tokens. So I have not tested that. If you find errors, please open an issue or PR. You can still use the app in simulate mode and copy/paste tweets manually without an API key.
 
 ## Quick Start (Beginners)
 
