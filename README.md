@@ -2,6 +2,8 @@
 
 ### A cross‑platform Python app to compose long tweets (threads) and help post them to Twitter. 
 
+<img src="screenshot.png" alt="TweetyPy Screenshot" width="800"/>
+
 ## Features
 
 - Includes a modern GUI (when PySide6 is installed) and a CLI for automation. 
