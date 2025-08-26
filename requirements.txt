@@ -1,0 +1,18 @@
+# TweetyPy runtime dependencies
+# Note: Most features degrade gracefully if some packages are missing.
+# - PySide6 enables the GUI; without it, use CLI/simulate modes.
+# - tweepy enables posting to Twitter; otherwise simulate-only.
+# - keyring stores credentials securely; otherwise encrypted file fallback is used.
+# - chardet improves text encoding detection when importing files.
+# - The remaining packages enable richer file import formats (optional).
+
+PySide6
+tweepy
+keyring
+chardet
+
+# Optional importers (install as needed)
+pdfminer.six
+python-docx
+beautifulsoup4
+lxml

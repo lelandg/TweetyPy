@@ -21,6 +21,8 @@ Notes:
 """
 from __future__ import annotations
 
+__version__ = "0.1.0"
+
 import argparse
 import csv
 import io
@@ -96,10 +98,11 @@ LOGGER = setup_logging()
 
 
 class ConfigManager:
-    """Manages API credentials with keyring preferred, JSON fallback."""
+    """Manages API credentials with keyring preferred, encrypted file fallback."""
 
     SERVICE = APP_NAME
     CONFIG_FILE = get_app_dir() / "config.json"
+    SECRETS_FILE = get_app_dir() / "secrets.bin"
 
     # Note: Do not store your keys in this file and then commit it to Git! (Or any repository.)
     SENSITIVE_KEYS = [
@@ -108,6 +111,102 @@ class ConfigManager:
         "access_token",
         "access_token_secret",
     ]
+
+    @staticmethod
+    def _dpapi_protect(data: bytes) -> bytes:
+        try:
+            import ctypes
+            import ctypes.wintypes as wt
+            class DATA_BLOB(ctypes.Structure):
+                _fields_ = [("cbData", wt.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+            CryptProtectData = ctypes.windll.crypt32.CryptProtectData
+            CryptUnprotectData = ctypes.windll.crypt32.CryptUnprotectData  # noqa: F401
+            in_blob = DATA_BLOB(len(data), ctypes.cast(ctypes.create_string_buffer(data), ctypes.POINTER(ctypes.c_char)))
+            out_blob = DATA_BLOB()
+            if CryptProtectData(ctypes.byref(in_blob), None, None, None, None, 0, ctypes.byref(out_blob)) == 0:
+                raise OSError("CryptProtectData failed")
+            try:
+                buf = ctypes.string_at(out_blob.pbData, out_blob.cbData)
+                ctypes.windll.kernel32.LocalFree(out_blob.pbData)
+                return buf
+            finally:
+                pass
+        except Exception:
+            return data
+
+    @staticmethod
+    def _dpapi_unprotect(data: bytes) -> bytes:
+        try:
+            import ctypes
+            import ctypes.wintypes as wt
+            class DATA_BLOB(ctypes.Structure):
+                _fields_ = [("cbData", wt.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+            CryptUnprotectData = ctypes.windll.crypt32.CryptUnprotectData
+            in_blob = DATA_BLOB(len(data), ctypes.cast(ctypes.create_string_buffer(data), ctypes.POINTER(ctypes.c_char)))
+            out_blob = DATA_BLOB()
+            if CryptUnprotectData(ctypes.byref(in_blob), None, None, None, None, 0, ctypes.byref(out_blob)) == 0:
+                raise OSError("CryptUnprotectData failed")
+            try:
+                buf = ctypes.string_at(out_blob.pbData, out_blob.cbData)
+                ctypes.windll.kernel32.LocalFree(out_blob.pbData)
+                return buf
+            finally:
+                pass
+        except Exception:
+            return data
+
+    @staticmethod
+    def _get_xor_key() -> bytes:
+        key_path = get_app_dir() / "key.bin"
+        if not key_path.exists():
+            try:
+                key = os.urandom(32)
+                key_path.write_bytes(key)
+            except Exception:
+                return b""
+        try:
+            return key_path.read_bytes()
+        except Exception:
+            return b""
+
+    @staticmethod
+    def _xor(data: bytes, key: bytes) -> bytes:
+        if not key:
+            return data
+        out = bytearray(len(data))
+        for i, b in enumerate(data):
+            out[i] = b ^ key[i % len(key)]
+        return bytes(out)
+
+    @classmethod
+    def _load_encrypted(cls) -> dict:
+        if not cls.SECRETS_FILE.exists():
+            return {}
+        try:
+            enc = cls.SECRETS_FILE.read_bytes()
+            if os.name == "nt":
+                raw = cls._dpapi_unprotect(enc)
+            else:
+                raw = cls._xor(enc, cls._get_xor_key())
+            try:
+                return json.loads(raw.decode("utf-8"))
+            except Exception:
+                return {}
+        except Exception as e:
+            LOGGER.warning(f"Failed to read secrets.bin: {e}")
+            return {}
+
+    @classmethod
+    def _save_encrypted(cls, secrets: dict) -> None:
+        try:
+            payload = json.dumps(secrets).encode("utf-8")
+            if os.name == "nt":
+                out = cls._dpapi_protect(payload)
+            else:
+                out = cls._xor(payload, cls._get_xor_key())
+            cls.SECRETS_FILE.write_bytes(out)
+        except Exception as e:
+            LOGGER.warning(f"Failed to write secrets.bin: {e}")
 
     @classmethod
     def load(cls) -> dict:
@@ -121,6 +220,7 @@ class ConfigManager:
                 LOGGER.warning(f"Failed to read config.json: {e}")
                 data = {}
         # Load sensitive values
+        enc_secrets = cls._load_encrypted()
         for key in cls.SENSITIVE_KEYS:
             val = None
             if keyring is not None:
@@ -129,7 +229,9 @@ class ConfigManager:
                 except Exception as e:  # pragma: no cover
                     LOGGER.warning(f"Keyring get failed for {key}: {e}")
             if val is None:
-                # Fallback from JSON for convenience if present (less secure)
+                val = enc_secrets.get(key)
+            if val is None:
+                # Backward-compat: fallback from JSON if present (less secure)
                 val = data.get(key)
             if val is not None:
                 data[key] = val
@@ -137,21 +239,35 @@ class ConfigManager:
 
     @classmethod
     def save(cls, values: dict) -> None:
-        # Save sensitive values to keyring when possible
+        # Save sensitive values to keyring when possible; else encrypted file
         to_file: dict = {}
+        secrets_to_write = cls._load_encrypted()
+        changed_secrets = False
         for k, v in values.items():
-            if k in cls.SENSITIVE_KEYS and keyring is not None:
-                try:
+            if k in cls.SENSITIVE_KEYS:
+                stored = False
+                if keyring is not None:
+                    try:
+                        if v is None or v == "":
+                            keyring.delete_password(cls.SERVICE, k)  # type: ignore
+                        else:
+                            keyring.set_password(cls.SERVICE, k, str(v))  # type: ignore
+                        stored = True
+                    except Exception as e:  # pragma: no cover
+                        LOGGER.warning(f"Keyring set failed for {k}: {e}")
+                if not stored:
+                    # encrypted fallback
                     if v is None or v == "":
-                        # Clear stored secret
-                        keyring.delete_password(cls.SERVICE, k)  # type: ignore
+                        if k in secrets_to_write:
+                            del secrets_to_write[k]
+                            changed_secrets = True
                     else:
-                        keyring.set_password(cls.SERVICE, k, str(v))  # type: ignore
-                    continue
-                except Exception as e:  # pragma: no cover
-                    LOGGER.warning(f"Keyring set failed for {k}: {e}")
-            # Fall back to config file
-            to_file[k] = v
+                        secrets_to_write[k] = str(v)
+                        changed_secrets = True
+            else:
+                to_file[k] = v
+        if changed_secrets:
+            cls._save_encrypted(secrets_to_write)
         # Merge with existing non-sensitive settings in the file
         existing = {}
         if cls.CONFIG_FILE.exists():
@@ -176,6 +292,39 @@ class ConfigManager:
         data = cls.load()
         data[key] = value
         cls.save(data)
+
+    @classmethod
+    def add_recent_file(cls, path: str, limit: int = 10) -> None:
+        """Add a file path to the recent files list stored in config.json.
+        - Keeps most-recent first, deduplicated.
+        - Trims the list to `limit` entries.
+        """
+        try:
+            p = str(Path(path))
+        except Exception:
+            p = str(path)
+        data = cls.load()
+        lst = data.get("recent_files")
+        if not isinstance(lst, list):
+            lst = []
+        # Normalize and deduplicate; move new path to front
+        lst = [str(x) for x in lst if isinstance(x, str)]
+        lst = [x for x in lst if x != p]
+        lst.insert(0, p)
+        if limit > 0:
+            lst = lst[:limit]
+        data["recent_files"] = lst
+        cls.save(data)
+
+    @classmethod
+    def get_recent_files(cls, max_n: Optional[int] = None) -> List[str]:
+        """Return the recent files list (optionally truncated)."""
+        data = cls.load()
+        lst = data.get("recent_files")
+        out = [str(x) for x in lst] if isinstance(lst, list) else []
+        if isinstance(max_n, int) and max_n > 0:
+            return out[:max_n]
+        return out
 
 
 # --------------- Text importers ---------------
@@ -484,7 +633,7 @@ if QtWidgets:
     class SettingsDialog(QtWidgets.QDialog):
         def __init__(self, parent=None):
             super().__init__(parent)
-            self.setWindowTitle("Settings - TweetyPy")
+            self.setWindowTitle(f"Settings - TweetyPy v{__version__}")
             self.setModal(True)
             layout = QtWidgets.QVBoxLayout(self)
 
@@ -557,8 +706,12 @@ if QtWidgets:
     class MainWindow(QtWidgets.QMainWindow):
         def __init__(self):
             super().__init__()
-            self.setWindowTitle("TweetyPy - Thread Composer")
+            self.setWindowTitle(f"TweetyPy - Thread Composer v{__version__}")
             self.resize(1000, 700)
+
+            self._current_session_path: Optional[Path] = None
+            self._history_dir = get_app_dir() / "History"
+            self._history_dir.mkdir(parents=True, exist_ok=True)
 
             # Central editor
             self.editor = QtWidgets.QTextEdit()
@@ -568,30 +721,74 @@ if QtWidgets:
             self.editor.setFont(font)
             self.setCentralWidget(self.editor)
 
+            # Preview and history panel splitter
+            self.right_panel = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+
             # Preview panel
-            # Build a small container with a checkbox above the preview list
             preview_container = QtWidgets.QWidget()
             preview_layout = QtWidgets.QVBoxLayout(preview_container)
             preview_layout.setContentsMargins(4, 4, 4, 4)
             preview_layout.setSpacing(6)
 
-            # Checkbox to enable click-to-copy behavior for preview items
             self.chk_copy_preview = QtWidgets.QCheckBox("Enable Copy to Clipboard")
             self.chk_copy_preview.setToolTip("When enabled, click a tweet in the preview to copy it to the clipboard.")
+            # Default enabled; will be overridden by persisted setting in _restore_window_state
+            self.chk_copy_preview.setChecked(True)
             preview_layout.addWidget(self.chk_copy_preview)
 
             self.preview = QtWidgets.QListWidget()
             self.preview.setMinimumWidth(350)
             self.preview.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+            # Enable soft-wrapping of preview items without altering underlying text or clipboard
+            self.preview.setWordWrap(True)
+            self.preview.setResizeMode(QtWidgets.QListView.Adjust)
+            self.preview.setUniformItemSizes(False)
+            self.preview.setTextElideMode(QtCore.Qt.ElideNone)
             preview_layout.addWidget(self.preview, 1)
 
-            dock = QtWidgets.QDockWidget("Preview", self)
-            dock.setWidget(preview_container)
+            preview_widget = QtWidgets.QWidget()
+            preview_widget.setLayout(preview_layout)
+
+            # History panel
+            history_container = QtWidgets.QWidget()
+            h_layout = QtWidgets.QVBoxLayout(history_container)
+            h_layout.setContentsMargins(4, 4, 4, 4)
+            h_layout.setSpacing(6)
+
+            btn_reload = QtWidgets.QPushButton("History")
+            btn_reload.setToolTip("Show saved sessions and previews")
+            h_layout.addWidget(btn_reload)
+
+            self.list_history = QtWidgets.QListWidget()
+            self.preview_session = QtWidgets.QTextEdit()
+            self.preview_session.setReadOnly(True)
+            # Soft wrap in history preview as well
+            self.preview_session.setLineWrapMode(QtWidgets.QTextEdit.WidgetWidth)
+            self.preview_session.setWordWrapMode(QtGui.QTextOption.WrapAtWordBoundaryOrAnywhere)
+            self.split_hist = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+            self.split_hist.addWidget(self.list_history)
+            self.split_hist.addWidget(self.preview_session)
+            self.split_hist.setStretchFactor(0, 1)
+            self.split_hist.setStretchFactor(1, 2)
+            h_layout.addWidget(self.split_hist, 1)
+
+            history_widget = QtWidgets.QWidget()
+            history_widget.setLayout(h_layout)
+
+            self.right_panel.addWidget(preview_widget)
+            self.right_panel.addWidget(history_widget)
+
+            dock = QtWidgets.QDockWidget("Right Panels", self)
+            dock.setWidget(self.right_panel)
             self.addDockWidget(QtCore.Qt.RightDockWidgetArea, dock)
 
-            # Clicking on a preview item copies its text to clipboard when enabled.
-            # Note: Qt's QApplication.clipboard() is cross‑platform (Windows/macOS/Linux), so this works across platforms.
+            # Signals
             self.preview.itemClicked.connect(self._on_preview_item_clicked)
+            btn_reload.clicked.connect(self._reload_history)
+            self.list_history.itemSelectionChanged.connect(self._on_history_selected)
+            self.list_history.itemDoubleClicked.connect(self._on_history_load)
+            # Persist checkbox choice immediately when toggled
+            self.chk_copy_preview.toggled.connect(self._on_copy_toggle)
 
             # Status bar labels
             self.status_chars = QtWidgets.QLabel("Chars: 0")
@@ -607,7 +804,13 @@ if QtWidgets:
             self._build_toolbar()
 
             # Signals
-            self.editor.textChanged.connect(self.update_preview)
+            self.editor.textChanged.connect(self._on_editor_changed)
+
+            # Restore window/splitter states
+            self._restore_window_state()
+
+            # Load previous session if available
+            self._load_last_session()
 
             # Initial preview
             self.update_preview()
@@ -672,6 +875,212 @@ if QtWidgets:
             self.status_chars.setText(f"Chars: {len(text)}")
             self.status_est.setText(f"Tweets: {len(tweets)}")
 
+        def _first_phrase(self, text: str) -> Optional[str]:
+            s = text.strip()
+            if not s:
+                return None
+            m = re.search(r"[\.!?]", s)
+            phrase = s if not m else s[: m.end()]
+            phrase = re.sub(r"\s+", " ", phrase).strip()
+            return phrase or None
+
+        def _session_filename(self, text: str) -> Optional[str]:
+            phrase = self._first_phrase(text)
+            if not phrase:
+                return None
+            safe = re.sub(r"[^A-Za-z0-9 _-]", "", phrase)[:60].strip()
+            if not safe:
+                safe = "session"
+            base = safe
+            i = 1
+            while True:
+                name = f"{base}.json" if i == 1 else f"{base} ({i}).json"
+                if not (self._history_dir / name).exists():
+                    return name
+                i += 1
+
+        def _save_session_auto(self):
+            # If user has an explicitly saved/loaded file, don't autosave to history
+            if ConfigManager.get("last_file"):
+                return
+            text = self.editor.toPlainText()
+            if not text.strip():
+                return
+            # Determine path if new
+            if self._current_session_path is None or not self._current_session_path.exists():
+                fname = self._session_filename(text)
+                if not fname:
+                    return  # don't save until first phrase exists
+                self._current_session_path = self._history_dir / fname
+            data = {
+                "text": text,
+                "timestamp": QtCore.QDateTime.currentDateTime().toString(QtCore.Qt.ISODate),
+            }
+            try:
+                self._current_session_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            except Exception as e:
+                LOGGER.warning(f"Auto-save failed: {e}")
+
+        def _on_editor_changed(self):
+            self.update_preview()
+            self._save_session_auto()
+
+        def _reload_history(self):
+            self.list_history.clear()
+            try:
+                files = sorted(self._history_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+                for f in files:
+                    self.list_history.addItem(f.name)
+            except Exception as e:
+                LOGGER.warning(f"History load failed: {e}")
+
+        def _on_history_selected(self):
+            items = self.list_history.selectedItems()
+            if not items:
+                self.preview_session.clear()
+                return
+            name = items[0].text()
+            path = self._history_dir / name
+            try:
+                obj = json.loads(path.read_text(encoding="utf-8"))
+                self.preview_session.setPlainText(obj.get("text", ""))
+            except Exception as e:
+                self.preview_session.setPlainText(f"Failed to load preview: {e}")
+
+        def _on_history_load(self, item: QtWidgets.QListWidgetItem):
+            name = item.text()
+            path = self._history_dir / name
+            try:
+                obj = json.loads(path.read_text(encoding="utf-8"))
+                self.editor.setPlainText(obj.get("text", ""))
+                self._current_session_path = path
+                # Clear explicit file so autosave returns to history mode
+                ConfigManager.set("last_file", None)
+                self.update_preview()
+                self.statusBar().showMessage(f"Loaded session: {name}", 2000)
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "Load Session", f"Failed: {e}")
+
+        def _on_preview_item_clicked(self, item: QtWidgets.QListWidgetItem):
+            if self.chk_copy_preview.isChecked():
+                QtWidgets.QApplication.clipboard().setText(item.text())
+                self.statusBar().showMessage("Tweet copied to clipboard", 2000)
+
+        def _load_last_session(self):
+            # Prefer last explicitly saved/loaded file
+            last_file = ConfigManager.get("last_file")
+            if last_file:
+                p = Path(last_file)
+                if p.exists() and p.is_file():
+                    try:
+                        txt = read_file_to_text(str(p))
+                        self.editor.setPlainText(txt)
+                        return
+                    except Exception:
+                        pass
+            # Otherwise fallback to last autosaved session
+            try:
+                files = sorted(self._history_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+                if files:
+                    self._current_session_path = files[0]
+                    obj = json.loads(files[0].read_text(encoding="utf-8"))
+                    self.editor.setPlainText(obj.get("text", ""))
+            except Exception as e:
+                LOGGER.warning(f"Load last session failed: {e}")
+
+        def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+            self._save_session_auto()
+            self._save_window_state()
+            return super().closeEvent(event)
+
+        def _on_copy_toggle(self, checked: bool):
+            # Save preference immediately to config
+            settings_path = ConfigManager.CONFIG_FILE
+            cfg = {}
+            if settings_path.exists():
+                try:
+                    cfg = json.loads(settings_path.read_text(encoding="utf-8"))
+                except Exception:
+                    cfg = {}
+            cfg["copy_preview_enabled"] = bool(checked)
+            try:
+                settings_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+            except Exception as e:
+                LOGGER.warning(f"Failed to persist copy_preview_enabled: {e}")
+
+        def _save_window_state(self):
+            settings_path = ConfigManager.CONFIG_FILE
+            cfg = {}
+            if settings_path.exists():
+                try:
+                    cfg = json.loads(settings_path.read_text(encoding="utf-8"))
+                except Exception:
+                    cfg = {}
+            cfg["win_geometry"] = bytes(self.saveGeometry()).hex()
+            cfg["win_state"] = bytes(self.saveState()).hex()
+            # Save splitter states
+            try:
+                cfg["right_panel_state"] = bytes(self.right_panel.saveState()).hex()
+            except Exception:
+                pass
+            try:
+                cfg["history_splitter_state"] = bytes(self.split_hist.saveState()).hex()
+            except Exception:
+                pass
+            # Save copy-to-clipboard checkbox state
+            try:
+                cfg["copy_preview_enabled"] = bool(self.chk_copy_preview.isChecked())
+            except Exception:
+                pass
+            try:
+                settings_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+            except Exception as e:
+                LOGGER.warning(f"Failed to save window state: {e}")
+
+        def _restore_window_state(self):
+            settings_path = ConfigManager.CONFIG_FILE
+            if not settings_path.exists():
+                return
+            try:
+                cfg = json.loads(settings_path.read_text(encoding="utf-8"))
+            except Exception:
+                return
+            geo = cfg.get("win_geometry")
+            st = cfg.get("win_state")
+            if geo:
+                try:
+                    self.restoreGeometry(bytes.fromhex(geo))
+                except Exception:
+                    pass
+            if st:
+                try:
+                    self.restoreState(bytes.fromhex(st))
+                except Exception:
+                    pass
+            # Restore splitters
+            rp = cfg.get("right_panel_state")
+            if rp:
+                try:
+                    self.right_panel.restoreState(bytes.fromhex(rp))
+                except Exception:
+                    pass
+            hs = cfg.get("history_splitter_state")
+            if hs:
+                try:
+                    self.split_hist.restoreState(bytes.fromhex(hs))
+                except Exception:
+                    pass
+            # Restore copy-to-clipboard preference (default True if not present)
+            try:
+                val = cfg.get("copy_preview_enabled")
+                if isinstance(val, bool):
+                    self.chk_copy_preview.setChecked(val)
+                else:
+                    self.chk_copy_preview.setChecked(True)
+            except Exception:
+                # If restore fails, keep default True
+                self.chk_copy_preview.setChecked(True)
+
         def on_new(self):
             if self._confirm_discard():
                 self.editor.clear()
@@ -682,6 +1091,11 @@ if QtWidgets:
                 try:
                     txt = read_file_to_text(file)
                     self.editor.setPlainText(txt)
+                    ConfigManager.set("last_file", file)
+                    ConfigManager.add_recent_file(file)
+                    # Stop autosaving to history when explicit file is in use
+                    self._current_session_path = None
+                    self.update_preview()
                 except Exception as e:
                     QtWidgets.QMessageBox.critical(self, "Open", str(e))
 
@@ -690,6 +1104,11 @@ if QtWidgets:
             if file:
                 try:
                     Path(file).write_text(self.editor.toPlainText(), encoding="utf-8")
+                    ConfigManager.set("last_file", file)
+                    ConfigManager.add_recent_file(file)
+                    # Stop autosaving to history when explicit file is in use
+                    self._current_session_path = None
+                    self.statusBar().showMessage("Draft saved", 2000)
                 except Exception as e:
                     QtWidgets.QMessageBox.critical(self, "Save", str(e))
 
@@ -728,7 +1147,7 @@ if QtWidgets:
 # --------------- Entry Point ---------------
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="TweetyPy - Compose and post Twitter threads from GUI or CLI.")
+    p = argparse.ArgumentParser(description=f"TweetyPy {__version__} - Compose and post Twitter threads from GUI or CLI.")
     p.add_argument("--file", dest="file", help="Path to input file to convert to text.")
     p.add_argument("--simulate", dest="post", action="store_false", help="Simulate posting (default).")
     p.add_argument("--post", dest="post", action="store_true", help="Actually post the thread (requires credentials and tweepy).")
