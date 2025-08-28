@@ -812,6 +812,9 @@ if QtWidgets:
             # Load previous session if available
             self._load_last_session()
 
+            # Populate history list on startup
+            self._reload_history()
+
             # Initial preview
             self.update_preview()
 
@@ -918,6 +921,16 @@ if QtWidgets:
             }
             try:
                 self._current_session_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                # Refresh history UI so autosaves are visible immediately
+                self._reload_history()
+                # Select the just-saved session in the list (if present)
+                try:
+                    name = self._current_session_path.name
+                    matches = self.list_history.findItems(name, QtCore.Qt.MatchExactly)
+                    if matches:
+                        self.list_history.setCurrentItem(matches[0])
+                except Exception:
+                    pass
             except Exception as e:
                 LOGGER.warning(f"Auto-save failed: {e}")
 
@@ -928,9 +941,24 @@ if QtWidgets:
         def _reload_history(self):
             self.list_history.clear()
             try:
-                files = sorted(self._history_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-                for f in files:
-                    self.list_history.addItem(f.name)
+                # 1) Autosaved sessions from History directory
+                session_files = sorted(self._history_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+                for f in session_files:
+                    item = QtWidgets.QListWidgetItem(f.name)
+                    item.setData(QtCore.Qt.UserRole, {"type": "session", "path": str(f)})
+                    self.list_history.addItem(item)
+                # 2) Recently opened/saved files from config.json (if they still exist)
+                recent_files = ConfigManager.get_recent_files()
+                for p in recent_files:
+                    try:
+                        fp = Path(p)
+                        if fp.exists() and fp.is_file():
+                            display = fp.name
+                            item = QtWidgets.QListWidgetItem(display)
+                            item.setData(QtCore.Qt.UserRole, {"type": "file", "path": str(fp)})
+                            self.list_history.addItem(item)
+                    except Exception:
+                        continue
             except Exception as e:
                 LOGGER.warning(f"History load failed: {e}")
 
@@ -939,27 +967,68 @@ if QtWidgets:
             if not items:
                 self.preview_session.clear()
                 return
-            name = items[0].text()
-            path = self._history_dir / name
+            item = items[0]
+            meta = item.data(QtCore.Qt.UserRole) or {}
+            itype = meta.get("type")
             try:
-                obj = json.loads(path.read_text(encoding="utf-8"))
-                self.preview_session.setPlainText(obj.get("text", ""))
+                if itype == "session":
+                    path = Path(meta.get("path", ""))
+                    obj = json.loads(path.read_text(encoding="utf-8"))
+                    self.preview_session.setPlainText(obj.get("text", ""))
+                elif itype == "file":
+                    path = Path(meta.get("path", ""))
+                    if path.exists() and path.is_file():
+                        txt = read_file_to_text(str(path))
+                        self.preview_session.setPlainText(txt)
+                    else:
+                        self.preview_session.setPlainText("File not found.")
+                else:
+                    # Fallback to previous behavior assuming session name
+                    name = item.text()
+                    path = self._history_dir / name
+                    obj = json.loads(path.read_text(encoding="utf-8"))
+                    self.preview_session.setPlainText(obj.get("text", ""))
             except Exception as e:
                 self.preview_session.setPlainText(f"Failed to load preview: {e}")
 
         def _on_history_load(self, item: QtWidgets.QListWidgetItem):
-            name = item.text()
-            path = self._history_dir / name
+            meta = item.data(QtCore.Qt.UserRole) or {}
+            itype = meta.get("type")
             try:
-                obj = json.loads(path.read_text(encoding="utf-8"))
-                self.editor.setPlainText(obj.get("text", ""))
-                self._current_session_path = path
-                # Clear explicit file so autosave returns to history mode
-                ConfigManager.set("last_file", None)
-                self.update_preview()
-                self.statusBar().showMessage(f"Loaded session: {name}", 2000)
+                if itype == "session":
+                    path = Path(meta.get("path", ""))
+                    obj = json.loads(path.read_text(encoding="utf-8"))
+                    self.editor.setPlainText(obj.get("text", ""))
+                    self._current_session_path = path
+                    # Clear explicit file so autosave returns to history mode
+                    ConfigManager.set("last_file", None)
+                    self.update_preview()
+                    self.statusBar().showMessage(f"Loaded session: {path.name}", 2000)
+                elif itype == "file":
+                    path = Path(meta.get("path", ""))
+                    if path.exists() and path.is_file():
+                        txt = read_file_to_text(str(path))
+                        self.editor.setPlainText(txt)
+                        ConfigManager.set("last_file", str(path))
+                        ConfigManager.add_recent_file(str(path))
+                        # Stop autosaving to history when explicit file is in use
+                        self._current_session_path = None
+                        self.update_preview()
+                        self.statusBar().showMessage(f"Loaded file: {path.name}", 2000)
+                    else:
+                        QtWidgets.QMessageBox.warning(self, "Load", "File not found.")
+                else:
+                    # Fallback to previous behavior assuming session name
+                    name = item.text()
+                    path = self._history_dir / name
+                    obj = json.loads(path.read_text(encoding="utf-8"))
+                    self.editor.setPlainText(obj.get("text", ""))
+                    self._current_session_path = path
+                    ConfigManager.set("last_file", None)
+                    self.update_preview()
+                    self.statusBar().showMessage(f"Loaded session: {name}", 2000)
             except Exception as e:
-                QtWidgets.QMessageBox.critical(self, "Load Session", f"Failed: {e}")
+                QtWidgets.QMessageBox.critical(self, "Load", f"Failed: {e}")
 
         def _on_preview_item_clicked(self, item: QtWidgets.QListWidgetItem):
             if self.chk_copy_preview.isChecked():
@@ -1096,6 +1165,8 @@ if QtWidgets:
                     # Stop autosaving to history when explicit file is in use
                     self._current_session_path = None
                     self.update_preview()
+                    # Refresh history to include/open reflect the file immediately
+                    self._reload_history()
                 except Exception as e:
                     QtWidgets.QMessageBox.critical(self, "Open", str(e))
 
@@ -1109,6 +1180,8 @@ if QtWidgets:
                     # Stop autosaving to history when explicit file is in use
                     self._current_session_path = None
                     self.statusBar().showMessage("Draft saved", 2000)
+                    # Refresh history to include the saved file immediately
+                    self._reload_history()
                 except Exception as e:
                     QtWidgets.QMessageBox.critical(self, "Save", str(e))
 
